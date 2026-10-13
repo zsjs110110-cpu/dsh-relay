@@ -1,0 +1,17 @@
+{
+  "name": "dsh-relay",
+  "version": "1.0.0",
+  "description": "Endpoint-to-endpoint message relay MCP server for DSH and other AI agents",
+  "main": "server.js",
+  "bin": { "dsh-relay": "server.js" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node -e \"require('./server.js')\""
+  },
+  "keywords": ["mcp", "relay", "messaging", "dsh", "agent"],
+  "license": "MIT",
+  "optionalDependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "engines": { "node": ">=20" }
+}
