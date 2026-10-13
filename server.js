@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * dsh-relay v2.1 — 五轮 Qoder 审查 + 端到端测试通过
- * 测试: test-e2e.js (21/21) test-mcp.js (18/18) test-prod.js (14/14)
- * 修复: HTTP 幂等性响应 id 字段丢失（端到端测试发现，静态审查漏检）
+ * dsh-relay v2.2 — long-poll + push 唤醒 + 管理端点 + metadata
+ * 五轮 Qoder 审查 + 端到端测试通过
+ * 测试: test-e2e.js test-mcp.js test-prod.js test-longpoll.js
  */
 'use strict';
 const http = require('http');
@@ -46,13 +46,14 @@ function initDb() {
       id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL,
       mode TEXT NOT NULL DEFAULT 'persistent', status TEXT NOT NULL DEFAULT 'online',
       token_hash TEXT NOT NULL, registered_at TEXT NOT NULL, last_seen_at TEXT,
-      ttl_seconds INTEGER, next_seq INTEGER DEFAULT 1, last_delivered_seq INTEGER DEFAULT 0, acked_seq INTEGER DEFAULT 0
+      ttl_seconds INTEGER, next_seq INTEGER DEFAULT 1, last_delivered_seq INTEGER DEFAULT 0, acked_seq INTEGER DEFAULT 0,
+      metadata TEXT
     );
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY, seq INTEGER NOT NULL, type TEXT DEFAULT 'message',
       source TEXT NOT NULL, target TEXT NOT NULL, priority TEXT DEFAULT 'normal',
       deadline TEXT, idempotency_key TEXT, correlation_id TEXT,
-      payload TEXT NOT NULL, received_at TEXT NOT NULL,
+      payload TEXT NOT NULL, raw_payload TEXT, received_at TEXT NOT NULL,
       status TEXT DEFAULT 'pending', delivered_at TEXT, acked_at TEXT,
       UNIQUE(target, seq)
     );
@@ -61,6 +62,9 @@ function initDb() {
     CREATE UNIQUE INDEX IF NOT EXISTS ux_msg_idem ON messages(target, idempotency_key) WHERE idempotency_key IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
   `);
+  // migration: 旧 DB 加列（新 DB 已有，ALTER 会失败被吞）
+  try { db.exec('ALTER TABLE endpoints ADD COLUMN metadata TEXT'); } catch {}
+  try { db.exec('ALTER TABLE messages ADD COLUMN raw_payload TEXT'); } catch {}
 }
 function now() { return new Date().toISOString(); }
 function audit(action, epId, msgId, detail) { try { db.prepare('INSERT INTO audit_log (ts, action, endpoint_id, message_id, detail) VALUES (?, ?, ?, ?, ?)').run(now(), action, epId || null, msgId || null, detail ? JSON.stringify(detail) : null); } catch {} }
@@ -93,7 +97,7 @@ function rateLimit(key) { const t = Date.now(); let a = (rateMap.get(key) || [])
 // ── 端注册 ──
 const VALID_TYPES = ['dsh', 'codex', 'zcode', 'qoder', 'custom'];
 const VALID_MODES = ['persistent', 'ephemeral'];
-function registerEndpoint(name, type, mode, ttl) {
+function registerEndpoint(name, type, mode, ttl, metadata) {
   name = String(name || '').trim().slice(0, 128); if (!name) throw new Error('name required');
   if (!VALID_TYPES.includes(type)) type = 'custom';
   if (!VALID_MODES.includes(mode)) mode = 'persistent';
@@ -104,8 +108,9 @@ function registerEndpoint(name, type, mode, ttl) {
   const cnt = db.prepare("SELECT COUNT(*) as c FROM endpoints WHERE status != 'expired'").get().c;
   if (cnt >= CFG.maxEndpoints) throw new Error('max endpoints reached');
   const id = base62Id('ep', 10), token = base62Id('tok', 16);
-  db.prepare(`INSERT INTO endpoints (id, name, type, mode, status, token_hash, registered_at, last_seen_at, ttl_seconds, next_seq, last_delivered_seq, acked_seq)
-    VALUES (?, ?, ?, ?, 'online', ?, ?, ?, ?, 1, 0, 0)`).run(id, name, type, mode, hashToken(token), now(), now(), ttl);
+  const meta = metadata ? JSON.stringify(metadata).slice(0, 4096) : null;
+  db.prepare(`INSERT INTO endpoints (id, name, type, mode, status, token_hash, registered_at, last_seen_at, ttl_seconds, next_seq, last_delivered_seq, acked_seq, metadata)
+    VALUES (?, ?, ?, ?, 'online', ?, ?, ?, ?, 1, 0, 0, ?)`).run(id, name, type, mode, hashToken(token), now(), now(), ttl, meta);
   audit('register', id, null, { name, type, mode });
   return { id, token };
 }
@@ -137,10 +142,10 @@ function enqueueTx(source, target, payload, opts) {
   try {
     const seq = ep.next_seq, id = base62Id('m', 12);
     try {
-      db.prepare(`INSERT INTO messages (id, seq, type, source, target, priority, deadline, idempotency_key, correlation_id, payload, received_at, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`)
+      db.prepare(`INSERT INTO messages (id, seq, type, source, target, priority, deadline, idempotency_key, correlation_id, payload, raw_payload, received_at, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`)
         .run(id, seq, opts.type || 'message', source, target, opts.priority || 'normal', opts.deadline || null,
-          opts.idempotencyKey || null, opts.correlationId || null, JSON.stringify(payload), now());
+          opts.idempotencyKey || null, opts.correlationId || null, JSON.stringify(payload), opts.rawPayload || null, now());
     } catch (e) {
       if (String(e).includes('UNIQUE')) {
         db.exec('ROLLBACK');
@@ -154,12 +159,19 @@ function enqueueTx(source, target, payload, opts) {
     db.prepare('UPDATE endpoints SET next_seq = next_seq + 1 WHERE id = ?').run(target);
     db.exec('COMMIT');
     audit('send', source, id, { target, seq });
+    notifyWaiters(target);
     return { id, seq, status: 'pending' };
   } catch (e) { try { db.exec('ROLLBACK'); } catch {} throw e; }
 }
 
+// ── long-poll waiter (push 唤醒) ──
+const pollWaiters = new Map(); // targetId -> Set<callback>
+function addWaiter(target, cb) { if (!pollWaiters.has(target)) pollWaiters.set(target, new Set()); pollWaiters.get(target).add(cb); }
+function removeWaiter(target, cb) { const s = pollWaiters.get(target); if (s) { s.delete(cb); if (s.size === 0) pollWaiters.delete(target); } }
+function notifyWaiters(target) { const s = pollWaiters.get(target); if (!s || s.size === 0) return; const cbs = [...s]; s.clear(); for (const cb of cbs) try { cb(); } catch {} }
+
 // ── poll ──
-function pollMessages(target, limit) {
+function doPoll(target, limit) {
   const ep = getEndpoint(target), ackedSeq = ep ? (ep.acked_seq || 0) : 0;
   const msgs = db.prepare("SELECT * FROM messages WHERE target = ? AND seq > ? AND status != 'acked' ORDER BY seq ASC LIMIT ?").all(target, ackedSeq, limit);
   if (msgs.length > 0) {
@@ -169,6 +181,18 @@ function pollMessages(target, limit) {
     audit('poll', target, null, { count: msgs.length });
   }
   return { messages: msgs.map(m => ({ ...m, payload: safeJsonParse(m.payload, { raw: true }), redelivered: m.status === 'delivered' })), upToSeq: msgs.length ? msgs[msgs.length - 1].seq : (ep ? ep.last_delivered_seq : 0) };
+}
+async function pollMessages(target, limit, wait = 0) {
+  let result = doPoll(target, limit);
+  if (result.messages.length > 0 || wait <= 0) return result;
+  // 无消息 → 注册 long-poll waiter，最多等 wait 秒
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; removeWaiter(target, cb); clearTimeout(timer); resolve(doPoll(target, limit)); };
+    const cb = () => finish();
+    addWaiter(target, cb);
+    const timer = setTimeout(finish, wait * 1000);
+  });
 }
 
 // ── ACK (P0-C: 单调) ──
@@ -183,21 +207,21 @@ function ackMessages(target, upToSeq) {
 
 // ── MCP 工具 ──
 const MCP_TOOLS = [
-  { name: 'relay_register', description: 'Register this session as an endpoint.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, type: { type: 'string', enum: VALID_TYPES }, mode: { type: 'string', enum: VALID_MODES }, ttl: { type: 'integer' } }, required: ['name'] } },
-  { name: 'relay_poll', description: 'Poll for incoming messages (non-blocking). Call relay_ack after processing.', inputSchema: { type: 'object', properties: { limit: { type: 'integer', default: 10 } } } },
+  { name: 'relay_register', description: 'Register this session as an endpoint.', inputSchema: { type: 'object', properties: { name: { type: 'string' }, type: { type: 'string', enum: VALID_TYPES }, mode: { type: 'string', enum: VALID_MODES }, ttl: { type: 'integer' }, metadata: { type: 'object', description: 'Custom metadata for this endpoint' } }, required: ['name'] } },
+  { name: 'relay_poll', description: 'Poll for incoming messages. Blocks up to timeout seconds if empty (long-poll). Call relay_ack after processing.', inputSchema: { type: 'object', properties: { limit: { type: 'integer', default: 10 }, timeout: { type: 'integer', default: 30, description: 'Max seconds to block waiting (0=non-blocking)' } } } },
   { name: 'relay_ack', description: 'Cumulative ACK: mark delivered messages up to upToSeq as consumed.', inputSchema: { type: 'object', properties: { upToSeq: { type: 'integer' } }, required: ['upToSeq'] } },
-  { name: 'relay_send', description: 'Send a message to another endpoint.', inputSchema: { type: 'object', properties: { target: { type: 'string' }, payload: { type: 'object' }, priority: { type: 'string', enum: ['normal', 'urgent'] }, idempotencyKey: { type: 'string' }, correlationId: { type: 'string' } }, required: ['target', 'payload'] } },
+  { name: 'relay_send', description: 'Send a message to another endpoint.', inputSchema: { type: 'object', properties: { target: { type: 'string' }, payload: { type: 'object' }, priority: { type: 'string', enum: ['normal', 'urgent'] }, deadline: { type: 'string', description: 'ISO timestamp' }, idempotencyKey: { type: 'string' }, correlationId: { type: 'string' }, rawPayload: { type: 'string', description: 'Optional raw payload alongside structured payload' } }, required: ['target', 'payload'] } },
   { name: 'relay_stats', description: 'Get your stats.', inputSchema: { type: 'object', properties: {} } },
   { name: 'relay_history', description: 'Read your message history.', inputSchema: { type: 'object', properties: { cursor: { type: 'integer', default: 0 }, limit: { type: 'integer', default: 50 } } } },
 ];
 let mcpEndpoint = null;
-function handleMcpCall(name, args) {
+async function handleMcpCall(name, args) {
   try {
     switch (name) {
-      case 'relay_register': { const r = registerEndpoint(args.name, args.type, args.mode, args.ttl); mcpEndpoint = { id: r.id, token: r.token }; return r; }
-      case 'relay_poll': { if (!mcpEndpoint) return { error: 'not registered' }; return pollMessages(mcpEndpoint.id, intParam(args.limit, CFG.pollLimit, 1, 100)); }
+      case 'relay_register': { const r = registerEndpoint(args.name, args.type, args.mode, args.ttl, args.metadata); mcpEndpoint = { id: r.id, token: r.token }; return r; }
+      case 'relay_poll': { if (!mcpEndpoint) return { error: 'not registered' }; return await pollMessages(mcpEndpoint.id, intParam(args.limit, CFG.pollLimit, 1, 100), intParam(args.timeout, 30, 0, 60)); }
       case 'relay_ack': { if (!mcpEndpoint) return { error: 'not registered' }; return ackMessages(mcpEndpoint.id, intParam(args.upToSeq, 0, 0, Infinity)); }
-      case 'relay_send': { if (!mcpEndpoint) return { error: 'not registered' }; if (!args.target || !args.payload) return { error: "missing 'target' or 'payload'" }; return enqueueTx(mcpEndpoint.id, args.target, args.payload, { priority: args.priority, idempotencyKey: args.idempotencyKey, correlationId: args.correlationId }); }
+      case 'relay_send': { if (!mcpEndpoint) return { error: 'not registered' }; if (!args.target || !args.payload) return { error: "missing 'target' or 'payload'" }; return enqueueTx(mcpEndpoint.id, args.target, args.payload, { priority: args.priority, idempotencyKey: args.idempotencyKey, correlationId: args.correlationId, deadline: args.deadline, rawPayload: args.rawPayload }); }
       case 'relay_stats': { if (!mcpEndpoint) return { error: 'not registered' }; const ep = getEndpoint(mcpEndpoint.id); const p = db.prepare("SELECT COUNT(*) as c FROM messages WHERE target = ? AND status = 'pending'").get(mcpEndpoint.id).c; const d = db.prepare("SELECT COUNT(*) as c FROM messages WHERE target = ? AND status = 'delivered'").get(mcpEndpoint.id).c; return { endpoint: ep ? { id: ep.id, name: ep.name, type: ep.type, mode: ep.mode, status: ep.status, acked_seq: ep.acked_seq, next_seq: ep.next_seq } : null, pending: p, delivered: d }; }
       case 'relay_history': { if (!mcpEndpoint) return { error: 'not registered' }; const ms = db.prepare("SELECT * FROM messages WHERE target = ? AND seq > ? ORDER BY seq ASC LIMIT ?").all(mcpEndpoint.id, intParam(args.cursor, 0), intParam(args.limit, 50, 1, 200)); return ms.map(m => ({ ...m, payload: safeJsonParse(m.payload, { raw: true }) })); }
       default: return { error: `unknown tool: ${name}` };
@@ -239,20 +263,21 @@ function handleMcpMessage(msg) {
       case 'initialize': mcpRespond(id, { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'dsh-relay', version: '2.0.0' } }); break;
       case 'ping': mcpRespond(id, {}); break;
       case 'tools/list': mcpRespond(id, { tools: MCP_TOOLS }); break;
-      case 'tools/call': { const r = handleMcpCall(args.name, args.arguments || {}); mcpRespond(id, { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: !!r.error }); break; }
+      case 'tools/call': { handleMcpCall(args.name, args.arguments || {}).then(r => { mcpRespond(id, { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }], isError: !!r.error }); }).catch(e => { mcpError(id, -32603, 'internal error'); console.error('[dsh-relay] MCP call error:', e); }); break; }
       default: mcpError(id, -32601, `method not found: ${method}`);
     }
   } catch (e) { console.error('[dsh-relay] MCP msg error:', e); }
 }
 
 // ── HTTP API ──
-const PUBLIC = new Set(['/health', '/help', '/metrics', '/']);
+const PUBLIC = new Set(['/health', '/health/ready', '/help', '/metrics', '/']);
 const HOSTS = CFG.httpPort ? new Set([`127.0.0.1:${CFG.httpPort}`, `localhost:${CFG.httpPort}`, `[::1]:${CFG.httpPort}`]) : new Set();
 function startHttp() {
   if (CFG.httpPort === 0) return;
   const server = http.createServer(async (req, res) => {
     try {
       const ip = req.socket.remoteAddress;
+      res._acceptText = (req.headers.accept || '').includes('text/plain');
       let url; try { url = new URL(req.url, 'http://localhost'); } catch { return jsonErr(res, 400, 'invalid url'); }
       res.setHeader('Access-Control-Allow-Origin', `http://127.0.0.1:${CFG.httpPort}`);
       res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-DSH-Signature, X-DSH-Timestamp');
@@ -261,6 +286,7 @@ function startHttp() {
       if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
       if (PUBLIC.has(url.pathname)) {
         if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { status: 'ok', uptime: process.uptime() });
+        if (req.method === 'GET' && url.pathname === '/health/ready') return json(res, 200, { status: 'ready', db: !!db, uptime: process.uptime() });
         if (req.method === 'GET' && url.pathname === '/help') return json(res, 200, HELP, 'text/plain');
         if (req.method === 'GET' && url.pathname === '/metrics') return json(res, 200, metrics(), 'text/plain; version=0.0.4');
         if (req.method === 'GET' && url.pathname === '/') return json(res, 200, webUi(), 'text/html; charset=utf-8');
@@ -277,7 +303,11 @@ function startHttp() {
       if (req.method === 'POST' && url.pathname === '/endpoints') {
         if (!rateLimit(ip)) return jsonErr(res, 429, 'rate limited', 'retry after 60s');
         const d = safeJsonParse(body, null); if (!d) return jsonErr(res, 400, 'invalid json');
-        try { return json(res, 201, registerEndpoint(d.name, d.type, d.mode, d.ttl)); } catch (e) { return jsonErr(res, 400, e.message); }
+        try { return json(res, 201, registerEndpoint(d.name, d.type, d.mode, d.ttl, d.metadata)); } catch (e) { return jsonErr(res, 400, e.message); }
+      }
+      // admin GET /endpoints → 全列表（在 endpoint auth 之前）
+      if (req.method === 'GET' && url.pathname === '/endpoints' && CFG.adminToken && safeTimingEqual(req.headers.authorization || '', `Bearer ${CFG.adminToken}`)) {
+        return json(res, 200, db.prepare("SELECT id, name, type, mode, status, registered_at, last_seen_at, metadata FROM endpoints WHERE status != 'expired' ORDER BY registered_at DESC").all());
       }
       const auth = extractAuth(req);
       let ep = auth ? verifyEndpointToken(auth.endpointId, auth.token) : null;
@@ -288,14 +318,14 @@ function startHttp() {
       if (req.method === 'DELETE' && tid && !sub) { db.prepare("UPDATE endpoints SET status = 'expired' WHERE id = ?").run(tid); audit('unregister', tid); return json(res, 200, { deleted: true }); }
       if (req.method === 'POST' && sub === 'heartbeat') { const ok = heartbeat(tid); return json(res, ok ? 200 : 404, ok ? { status: 'online' } : { error: 'not found' }); }
       if (req.method === 'POST' && sub === 'ack') { const d = safeJsonParse(body, null); if (!d) return jsonErr(res, 400, 'invalid json'); return json(res, 200, ackMessages(tid, intParam(d.upToSeq, 0, 0, Infinity))); }
-      if (req.method === 'GET' && sub === 'inbox') { return json(res, 200, pollMessages(tid, intParam(url.searchParams.get('limit'), CFG.pollLimit, 1, 100))); }
+      if (req.method === 'GET' && sub === 'inbox') { const w = intParam(url.searchParams.get('wait'), 0, 0, 60); return json(res, 200, await pollMessages(tid, intParam(url.searchParams.get('limit'), CFG.pollLimit, 1, 100), w)); }
       if (req.method === 'POST' && url.pathname === '/inbox') {
         if (!rateLimit(ep.id)) return jsonErr(res, 429, 'rate limited');
         const sig = req.headers['x-dsh-signature'] || '', ts = req.headers['x-dsh-timestamp'] || '';
         if (CFG.hmacSecret && !verifyHmac(body, sig, ts)) return jsonErr(res, 401, 'invalid signature', 'set X-DSH-Signature + X-DSH-Timestamp');
         const d = safeJsonParse(body, null); if (!d) return jsonErr(res, 400, 'invalid json');
         if (!d.target || !d.payload) return jsonErr(res, 400, "missing 'target' or 'payload'");
-        const r = enqueueTx(ep.id, d.target, d.payload, { priority: d.priority, idempotencyKey: d.idempotencyKey, correlationId: d.correlationId });
+        const r = enqueueTx(ep.id, d.target, d.payload, { priority: d.priority, idempotencyKey: d.idempotencyKey, correlationId: d.correlationId, deadline: d.deadline, rawPayload: d.rawPayload });
         if (r.error) { const c = r.code || 500; const body = { error: r.error }; if (r.id) { body.id = r.id; body.seq = r.seq; } return json(res, c, body); }
         return json(res, 202, r);
       }
@@ -317,16 +347,24 @@ function readBody(req, max = 65536) {
     req.on('error', () => { if (!done) { done = true; clearTimeout(timer); resolve(null); } });
   });
 }
-function json(res, code, body, ct = 'application/json') { const t = ct === 'application/json' ? JSON.stringify(body, null, 2) : body; res.writeHead(code, { 'Content-Type': ct }); res.end(t); }
+function json(res, code, body, ct = 'application/json') {
+  if (ct === 'application/json' && res._acceptText && body && typeof body === 'object') {
+    const flat = (o) => Array.isArray(o) ? o.map(flat).join('\n') : Object.entries(o).map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\t');
+    res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end(flat(body)); return;
+  }
+  const t = ct === 'application/json' ? JSON.stringify(body, null, 2) : body;
+  res.writeHead(code, { 'Content-Type': ct }); res.end(t);
+}
 function jsonErr(res, code, error, hint) { json(res, code, { error, ...(hint ? { hint } : {}) }); }
 function extractAuth(req) { const a = req.headers.authorization || ''; if (!a.startsWith('Bearer ')) return null; const t = a.slice(7), i = t.lastIndexOf(':'); return i < 1 ? null : { endpointId: t.slice(0, i), token: t.slice(i + 1) }; }
 function metrics() { const p = db.prepare("SELECT COUNT(*) as c FROM messages WHERE status = 'pending'").get().c; const d = db.prepare("SELECT COUNT(*) as c FROM messages WHERE status = 'delivered'").get().c; const o = db.prepare("SELECT COUNT(*) as c FROM endpoints WHERE status = 'online'").get().c; return `# HELP dsh_relay_pending Pending\ndsh_relay_pending ${p}\n# HELP dsh_relay_delivered Delivered\ndsh_relay_delivered ${d}\n# HELP dsh_relay_online Online\ndsh_relay_online ${o}\n`; }
-const HELP = `dsh-relay v2.0 — Endpoint-to-endpoint message relay
-POST /endpoints {"name","type","mode","ttl?"} → {id, token}
+const HELP = `dsh-relay v2.2 — Endpoint-to-endpoint message relay
+POST /endpoints {"name","type","mode","ttl?","metadata?"} → {id, token}
 POST /inbox {"target","payload",...} Auth: Bearer <id>:<token> HMAC: X-DSH-Signature+X-DSH-Timestamp
 POST /endpoints/{id}/ack {"upToSeq"} | DELETE /endpoints/{id} | POST /endpoints/{id}/heartbeat
-GET /endpoints/{id}/inbox?limit=N | GET /endpoints (own) | GET /health /metrics /audit / /help
-MCP: relay_register relay_poll relay_ack relay_send relay_stats relay_history`;
+GET /endpoints/{id}/inbox?limit=N&wait=30 (long-poll) | GET /endpoints (own; admin=all)
+GET /health /health/ready /metrics /audit / /help  | Accept: text/plain → plain text
+MCP: relay_register relay_poll(timeout,30s) relay_ack relay_send relay_stats relay_history`;
 function webUi() { return `<!DOCTYPE html><html><head><meta charset=utf-8><title>dsh-relay</title></head><body><h1>dsh-relay</h1><p><a href=/help>/help</a></p></body></html>`; }
 
 // ── 定时 ──

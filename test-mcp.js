@@ -127,7 +127,7 @@ async function run() {
 
     // 9. MCP relay_poll（stdio-B 收消息）
     console.log('\n[9] MCP relay_poll...');
-    resp = await mcp.call('tools/call', { name: 'relay_poll', arguments: { limit: 10 } });
+    resp = await mcp.call('tools/call', { name: 'relay_poll', arguments: { limit: 10, timeout: 0 } });
     let pollResult;
     try { pollResult = JSON.parse(resp.result.content[0].text); } catch { pollResult = null; }
     log(pollResult && pollResult.messages && pollResult.messages.length === 1, `poll → ${pollResult && pollResult.messages ? pollResult.messages.length : 0} msgs`, '');
@@ -153,7 +153,7 @@ async function run() {
 
     // 12. MCP relay_poll again (empty)
     console.log('\n[12] MCP relay_poll again (应空)...');
-    resp = await mcp.call('tools/call', { name: 'relay_poll', arguments: { limit: 10 } });
+    resp = await mcp.call('tools/call', { name: 'relay_poll', arguments: { limit: 10, timeout: 0 } });
     let poll2;
     try { poll2 = JSON.parse(resp.result.content[0].text); } catch { poll2 = null; }
     log(poll2 && poll2.messages && poll2.messages.length === 0, `poll → ${poll2 && poll2.messages ? poll2.messages.length : '?'} msgs`, '');
